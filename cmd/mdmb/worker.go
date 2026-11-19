@@ -28,6 +28,7 @@ func connectWork(ctx context.Context, cwd *ConnectWorkerData) error {
 
 func startConnectWorkers(ctx context.Context, cwds []*ConnectWorkerData, workers, iterations int) {
 	var wg sync.WaitGroup
+	var statsMu sync.Mutex
 	queue := make(chan *ConnectWorkerData, workers)
 	var (
 		totalCt int
@@ -43,31 +44,31 @@ func startConnectWorkers(ctx context.Context, cwds []*ConnectWorkerData, workers
 		go func() {
 			defer wg.Done()
 			for cwd := range queue {
-				totalCt++
 				started := time.Now()
 				err := connectWork(ctx, cwd)
 				d := time.Since(started)
-				durrVals[totalCt-1] = d
+
+				statsMu.Lock()
+				durrVals[totalCt] = d
+				totalCt++
 				if err != nil {
 					errCt++
+				} else {
+					durrAcc += d
+					if durrLow == 0 || d < durrLow {
+						durrLow = d
+					}
+					if d > durrHi {
+						durrHi = d
+					}
+				}
+				statsMu.Unlock()
+
+				if err != nil {
 					fmt.Println()
 					log.Println(fmt.Errorf("device connect for device %s: %w", cwd.Device.UDID, err))
-					continue
 				} else {
 					fmt.Print(".")
-				}
-				durrAcc += d
-				if durrLow == 0 {
-					durrLow = d
-				}
-				if durrHi == 0 {
-					durrHi = d
-				}
-				if d < durrLow {
-					durrLow = d
-				}
-				if d > durrHi {
-					durrHi = d
 				}
 			}
 		}()

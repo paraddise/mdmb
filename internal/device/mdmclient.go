@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"errors"
+	"sync"
 
 	"github.com/jessepeterson/cfgprofiles"
 	"github.com/jessepeterson/mdmb/protocol"
@@ -20,30 +21,17 @@ type MDMClient struct {
 
 	transport *protocol.Transport
 
-	notNow bool
+	notNow        bool
+	declarativeMu sync.Mutex
 }
 
 func (c *MDMClient) loadIdentityFromKeychain(uuid string) error {
-	if uuid == "" {
-		return errors.New("invalid keychain UUID")
-	}
-	kciID, err := LoadKeychainItem(c.Device.SystemKeychain(), uuid)
+	cert, key, err := c.Device.SystemKeychain().loadIdentity(uuid)
 	if err != nil {
 		return err
 	}
-
-	kciKey, err := LoadKeychainItem(c.Device.SystemKeychain(), kciID.IdentityKeyUUID)
-	if err != nil {
-		return err
-	}
-
-	kciCert, err := LoadKeychainItem(c.Device.SystemKeychain(), kciID.IdentityCertificateUUID)
-	if err != nil {
-		return err
-	}
-
-	c.IdentityPrivateKey = kciKey.Key
-	c.IdentityCertificate = kciCert.Certificate
+	c.IdentityPrivateKey = key
+	c.IdentityCertificate = cert
 	return nil
 }
 

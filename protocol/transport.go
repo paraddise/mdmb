@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	// CheckInMIMEType is the HTTP MIME type of Apple MDM check-in messages.
+	// MDMMIMEType identifies an Apple MDM command poll or result.
+	MDMMIMEType = "application/x-apple-aspen-mdm"
+	// CheckInMIMEType identifies an Apple MDM check-in request.
 	CheckInMIMEType = "application/x-apple-aspen-mdm-checkin"
 
 	// MDMSignatureHeader is the HTTP header name for the in-message
@@ -136,9 +138,13 @@ func (t *Transport) doRequest(ctx context.Context, body io.Reader, checkin bool)
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15")
+
+	mime := MDMMIMEType
 	if checkin {
-		req.Header.Set("Content-Type", CheckInMIMEType)
+		mime = CheckInMIMEType
 	}
+	req.Header.Set("Content-Type", mime)
 
 	if t.signMessage {
 		sig, err := t.SignMessage(ctx, bodyBuf.Bytes())

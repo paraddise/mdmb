@@ -2,46 +2,169 @@ package device
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
-	"github.com/groob/plist"
-	"github.com/jessepeterson/cfgprofiles"
+	"github.com/jessepeterson/mdmb/internal/diagnostics"
 )
 
-func (c *MDMClient) handleMDMCommand(ctx context.Context, reqType, commandUUID string, respBytes []byte) (interface{}, error) {
-	if c.notNow {
-		return &ConnectRequest{
-			UDID:        c.Device.UDID,
-			CommandUUID: commandUUID,
-			Status:      "NotNow",
-			RequestType: reqType,
-		}, nil
-	}
+var errCommandFormat = errors.New("invalid command format")
 
+func (c *MDMClient) handleMDMEnvelope(ctx context.Context, reqType, commandUUID string, command map[string]any) any {
+	envelope := ConnectRequest{UDID: c.Device.UDID, CommandUUID: commandUUID, Status: "Acknowledged"}
+	if c.notNow {
+		envelope.Status = "NotNow"
+		return &envelope
+	}
+	var err error
+	var result any
+	if command == nil || reqType == "" {
+		err = errCommandFormat
+	} else if err = validateFields(command, map[string]string{"RequestRequiresNetworkTether": "bool"}); err == nil {
+		result, err = c.dispatchCommand(ctx, reqType, envelope, command)
+	}
+	if err == nil {
+		return result
+	}
+	envelope.Status = "Error"
+	if errors.Is(err, errCommandFormat) {
+		envelope.Status = "CommandFormatError"
+	}
+	diagnostics.Printf(ctx, os.Stdout, "MDM %q UUID %q: %v\n", reqType, commandUUID, err)
+	envelope.ErrorChain = []ErrorChain{{
+		ErrorCode: 12021, ErrorDomain: "MCMDMErrorDomain", LocalizedDescription: err.Error(),
+	}}
+	return &envelope
+}
+
+func (c *MDMClient) dispatchCommand(ctx context.Context, reqType string, envelope ConnectRequest, command map[string]any) (any, error) {
+	d := c.Device
+	response := map[string]any{"UDID": envelope.UDID, "CommandUUID": envelope.CommandUUID, "Status": envelope.Status}
 	switch reqType {
 	case "DeviceInformation":
-		return c.handleDeviceInfo(respBytes)
-	case "ProfileList":
-		return c.handleProfileList(reqType, commandUUID)
+		return c.handleDeviceInfo(ctx, envelope, command)
+	case "SecurityInfo":
+		return &SecurityInfoResponse{ConnectRequest: envelope, SecurityInfo: d.EffectiveSecurityInfo()}, nil
+	case "ProfileList", "CertificateList":
+		if err := validateFields(command, map[string]string{"ManagedOnly": "bool"}); err != nil {
+			return nil, err
+		}
+		managed := boolField(command, "ManagedOnly")
+		var err error
+		if reqType == "ProfileList" {
+			response[reqType], err = d.profileInventory(managed)
+		} else {
+			response[reqType], err = d.certificateInventory(managed)
+		}
+		return response, err
 	case "InstallProfile":
-		return c.handleInstallProfile(ctx, respBytes)
+		if err := validateFields(command, map[string]string{"Payload": "data!"}); err != nil {
+			return nil, err
+		}
+		id, err := d.installProfileFromMDM(ctx, command["Payload"].([]byte))
+		return &InstallProfileResponse{ConnectRequest: envelope, profileID: id}, err
+	case "RemoveProfile":
+		if err := validateFields(command, map[string]string{"Identifier": "string!"}); err != nil {
+			return nil, err
+		}
+		id := stringField(command, "Identifier")
+		if id == d.MDMProfileIdentifier {
+			return nil, errors.New("active enrollment profile cannot be removed")
+		}
+		return response, d.SystemProfileStore().removeProfile(id)
+	case "InstallApplication", "InstallEnterpriseApplication":
+		app, err := d.installApplication(reqType, command)
+		if err == nil && reqType == "InstallApplication" {
+			response["Identifier"], response["State"] = app.Identifier, "Managed"
+		}
+		return response, err
+	case "RemoveApplication":
+		if err := validateFields(command, map[string]string{"Identifier": "string!"}); err != nil {
+			return nil, err
+		}
+		return response, d.updateSimulatorState(func(state *simulatorState) error {
+			delete(state.Applications, stringField(command, "Identifier"))
+			return nil
+		})
+	case "InstalledApplicationList", "ManagedApplicationList", "ManagedApplicationConfiguration", "ManagedApplicationAttributes":
+		fields, err := d.applicationInventory(reqType, command)
+		for key, value := range fields {
+			response[key] = value
+		}
+		return response, err
+	case "Settings":
+		var err error
+		response["Settings"], err = d.applySettings(command)
+		return response, err
+	case "DeclarativeManagement":
+		token, err := declarativeCommandToken(command)
+		return &declarativeManagementResponse{ConnectRequest: envelope, token: token}, err
 	default:
-		fmt.Printf("MDM command not handled: %s UUID %s\n", reqType, commandUUID)
-		return &ConnectRequest{
-			UDID:        c.Device.UDID,
-			CommandUUID: commandUUID,
-			RequestType: reqType,
-			Status:      "Error",
-			ErrorChain: []ErrorChain{
-				{
-					ErrorCode:            12021,
-					ErrorDomain:          "MCMDMErrorDomain",
-					LocalizedDescription: fmt.Sprintf("Unknown command: %s <MDMClientError:91>", reqType),
-				},
-			},
-		}, nil
+		if err := validateSimulatedAction(reqType, command); err != nil {
+			return nil, err
+		}
+		diagnostics.Printf(ctx, os.Stdout, "MDM simulated %s for %q, command %q\n", reqType, d.UDID, envelope.CommandUUID)
+		return response, nil
 	}
+}
+
+func validateSimulatedAction(reqType string, command map[string]any) error {
+	var fields map[string]string
+	switch reqType {
+	case "RestartDevice":
+		fields = map[string]string{"NotifyUser": "bool", "RebuildKernelCache": "bool", "KextPaths": "strings"}
+	case "ShutDownDevice", "StopMirroring":
+	case "EraseDevice":
+		fields = map[string]string{"PIN": "string", "PreserveDataPlan": "bool", "DisallowProximitySetup": "bool",
+			"ObliterationBehavior": "string", "ReturnToService": "dict"}
+	case "DeviceLock":
+		fields = map[string]string{"PIN": "string", "Message": "string", "PhoneNumber": "string"}
+	case "ClearPasscode":
+		fields = map[string]string{"UnlockToken": "data!"}
+	case "SetRecoveryLock":
+		fields = map[string]string{"NewPassword": "string", "CurrentPassword": "string"}
+		// An empty new password disables Recovery Lock.
+		if _, ok := command["NewPassword"]; !ok {
+			return fmt.Errorf("%w: missing NewPassword", errCommandFormat)
+		}
+	case "AccountConfiguration":
+		fields = map[string]string{"SkipPrimarySetupAccountCreation": "bool", "SetPrimarySetupAccountAsRegularUser": "bool",
+			"PrimaryAccountFullName": "string", "PrimaryAccountUserName": "string",
+			"DontAutoPopulatePrimaryAccountInfo": "bool", "LockPrimaryAccountInfo": "bool",
+			"AutoSetupAdminAccounts": "array", "ManagedLocalUserShortName": "string"}
+		if accounts, ok := command["AutoSetupAdminAccounts"].([]any); ok {
+			for _, entry := range accounts {
+				account, _ := entry.(map[string]any)
+				if err := validateFields(account, map[string]string{"shortName": "string!", "fullName": "string!", "passwordHash": "data!"}); err != nil {
+					return err
+				}
+			}
+		}
+	case "DeleteUser":
+		fields = map[string]string{"UserName": "string", "ForceDeletion": "bool", "DeleteAllUsers": "bool"}
+		if stringField(command, "UserName") == "" && !boolField(command, "DeleteAllUsers") {
+			return fmt.Errorf("%w: missing UserName or DeleteAllUsers", errCommandFormat)
+		}
+	case "SetAutoAdminPassword":
+		fields = map[string]string{"GUID": "string!", "passwordHash": "data!"}
+	case "InstallMedia":
+		fields = map[string]string{"MediaType": "string!", "iTunesStoreID": "int", "MediaURL": "string",
+			"PersistentID": "string", "Kind": "string", "Version": "string", "Author": "string", "Title": "string"}
+		id, _ := unsignedField(command["iTunesStoreID"])
+		if id == 0 && stringField(command, "MediaURL") == "" {
+			return fmt.Errorf("%w: missing media source", errCommandFormat)
+		}
+	case "RequestMirroring":
+		fields = map[string]string{"DestinationName": "string", "DestinationDeviceID": "string", "Password": "string", "ScanTime": "int"}
+		if stringField(command, "DestinationName") == "" && stringField(command, "DestinationDeviceID") == "" {
+			return fmt.Errorf("%w: missing mirroring destination", errCommandFormat)
+		}
+	default:
+		return fmt.Errorf("unknown command %q", reqType)
+	}
+	return validateFields(command, fields)
 }
 
 type DeviceInfoCommand struct {
@@ -56,154 +179,31 @@ type DeviceInfo struct {
 
 type DeviceInfoResponse struct {
 	ConnectRequest
-	QueryResponses map[string]string
+	QueryResponses map[string]any
 }
 
-func (c *MDMClient) handleDeviceInfo(respBytes []byte) (interface{}, error) {
-	cmd := &DeviceInfo{}
-	err := plist.Unmarshal(respBytes, cmd)
-	if err != nil {
+func (c *MDMClient) handleDeviceInfo(ctx context.Context, envelope ConnectRequest, command map[string]any) (any, error) {
+	if err := validateFields(command, map[string]string{"Queries": "strings!", "DeviceAttestationNonce": "data"}); err != nil {
 		return nil, err
 	}
-	resp := &DeviceInfoResponse{
-		ConnectRequest: ConnectRequest{
-			UDID:        c.Device.UDID,
-			Status:      "Acknowledged",
-			CommandUUID: cmd.CommandUUID,
-			RequestType: cmd.Command.RequestType,
-		},
-		QueryResponses: make(map[string]string),
-	}
-	// TODO: check MDM enrollment permission bits in all of this?
-	queries := cmd.Command.Queries
-	if len(queries) == 0 {
-		queries = []string{
-			"DeviceName",
-			"SerialNumber",
-			"UDID",
+	resp := &DeviceInfoResponse{ConnectRequest: envelope, QueryResponses: map[string]any{}}
+	responses := c.Device.QueryResponses()
+	var unavailable []string
+	for _, item := range command["Queries"].([]any) {
+		key := item.(string)
+		if val, ok := responses[key]; ok {
+			resp.QueryResponses[key] = val
+		} else {
+			unavailable = append(unavailable, key)
 		}
 	}
-	var unknownQueries []string
-	for _, v := range queries {
-		switch v {
-		case "DeviceName":
-			resp.QueryResponses[v] = c.Device.ComputerName
-		case "SerialNumber":
-			resp.QueryResponses[v] = c.Device.Serial
-		case "UDID":
-			resp.QueryResponses[v] = c.Device.UDID
-		default:
-			unknownQueries = append(unknownQueries, v)
-		}
-	}
-	fmt.Printf("unknown DeviceInfo queries: %s\n", strings.Join(unknownQueries, ", "))
-	return resp, nil
-}
-
-// type ProfileListCommand struct {
-// 	ConnectResponseCommand
-// 	ManagedOnly                  bool `plist:",omitempty"`
-// 	RequestRequiresNetworkTether bool `plist:",omitempty"`
-// }
-
-// type ProfileList struct {
-// 	Command     ProfileListCommand
-// 	CommandUUID string
-// }
-
-type ProfileListResponse struct {
-	ConnectRequest
-	ProfileList []*profileListProfile
-}
-
-type profileListProfile struct {
-	cfgprofiles.Profile
-	// SignerCertificates []...
-}
-
-// Reassembles profile payloads with only the generic "common" payload and wraps in profile wrapper struct
-func profileForProfileList(p *cfgprofiles.Profile) *profileListProfile {
-	genericPayloads := []*cfgprofiles.Payload{}
-	for _, v := range p.PayloadContent {
-		genericPayloads = append(genericPayloads, cfgprofiles.CommonPayload(v.Payload))
-		fmt.Println(genericPayloads)
-	}
-	newProfile := &profileListProfile{
-		Profile: *p,
-	}
-	newProfile.Profile.PayloadContent = nil
-	for _, v := range genericPayloads {
-		newProfile.Profile.AddPayload(v)
-	}
-	return newProfile
-}
-
-func (c *MDMClient) handleProfileList(reqType, commandUUID string) (interface{}, error) {
-	// since we don't handle any of the custom command members just
-	// ignore it for now
-	//
-	// cmd := &ProfileList{}
-	// err := plist.Unmarshal(respBytes, cmd)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	resp := &ProfileListResponse{
-		ConnectRequest: ConnectRequest{
-			UDID:        c.Device.UDID,
-			Status:      "Acknowledged",
-			CommandUUID: commandUUID,
-			RequestType: reqType,
-		},
-	}
-	uuids, err := c.Device.SystemProfileStore().ListUUIDs()
-	if err != nil {
-		return nil, err
-	}
-	for _, uuid := range uuids {
-		// fmt.Println(uuid)
-		p, err := c.Device.SystemProfileStore().Load(uuid)
-		if err != nil {
-			fmt.Printf("error loading profile: %s\n", err)
-		}
-		newProfile := profileForProfileList(p)
-		resp.ProfileList = append(resp.ProfileList, newProfile)
+	if len(unavailable) > 0 {
+		diagnostics.Printf(ctx, os.Stdout, "unavailable DeviceInformation queries: %q\n", strings.Join(unavailable, ", "))
 	}
 	return resp, nil
-}
-
-type InstallProfileCommand struct {
-	ConnectResponseCommand
-	Payload                      []byte
-	RequestRequiresNetworkTether bool `plist:",omitempty"`
-}
-
-type InstallProfile struct {
-	Command     InstallProfileCommand
-	CommandUUID string
 }
 
 type InstallProfileResponse struct {
 	ConnectRequest
-	RequestType string
-}
-
-func (c *MDMClient) handleInstallProfile(ctx context.Context, respBytes []byte) (interface{}, error) {
-	cmd := &InstallProfile{}
-	err := plist.Unmarshal(respBytes, cmd)
-	if err != nil {
-		return nil, err
-	}
-	err = c.Device.installProfileFromMDM(ctx, cmd.Command.Payload)
-	if err != nil {
-		return nil, err
-	}
-	resp := &InstallProfileResponse{
-		ConnectRequest: ConnectRequest{
-			UDID:        c.Device.UDID,
-			Status:      "Acknowledged",
-			CommandUUID: cmd.CommandUUID,
-			RequestType: cmd.Command.RequestType,
-		},
-	}
-	return resp, nil
+	profileID string
 }

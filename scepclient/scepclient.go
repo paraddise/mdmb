@@ -3,6 +3,7 @@ package scepclient
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -10,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/smallstep/pkcs7"
 	"github.com/smallstep/scep"
@@ -49,9 +49,6 @@ func WithSignerKeypair(p IdentityProvider) Option {
 }
 
 func New(scepURL string, opts ...Option) (*Client, error) {
-	if !strings.HasSuffix(scepURL, "?") {
-		scepURL += "?"
-	}
 	c := &Client{
 		scepURL: scepURL,
 		doer:    http.DefaultClient,
@@ -93,23 +90,23 @@ func (c *Client) do(ctx context.Context, op string, message []byte) (*http.Respo
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", "CertificateService/1 CFNetwork/3826.400.120 Darwin/24.3.0")
 
 	q := req.URL.Query()
 	q.Set("operation", op)
-	if len(message) > 0 {
-		if method != http.MethodPost && op == "PKIOperation" {
-			// include the message as an HTTP parameter only when
-			// a message is present and for non-POST (non-PKIOperation) requests
-			q.Set("message", base64.URLEncoding.EncodeToString(message))
-		} else {
-			q.Set("message", string(message))
+	if method != http.MethodPost && len(message) > 0 {
+		// GET carries the encoded SCEP message in the query. POST carries it in the body.
+		value := string(message)
+		if op == "PKIOperation" {
+			value = base64.URLEncoding.EncodeToString(message)
 		}
+		q.Set("message", value)
 	}
 	req.URL.RawQuery = q.Encode()
 
 	if method == http.MethodPost {
 		// some servers/proxies have problems without a content-type
-		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Content-Type", "application/x-pki-message")
 	}
 
 	return c.doer.Do(req)
@@ -123,6 +120,9 @@ func (c *Client) GetCACaps(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SCEP server returned HTTP %d", resp.StatusCode)
+	}
 
 	c.caps, err = io.ReadAll(io.LimitReader(resp.Body, Limit1MB))
 	return c.caps, err
@@ -135,6 +135,9 @@ func (c *Client) GetCACert(ctx context.Context, message []byte) ([]*x509.Certifi
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SCEP server returned HTTP %d", resp.StatusCode)
+	}
 
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, Limit1MB))
 	if err != nil {
@@ -174,6 +177,10 @@ func (c *Client) Sign(ctx context.Context, csr *x509.CertificateRequest, selecto
 		// },
 	}
 
+	if len(tmpl.Recipients) == 0 {
+		return nil, errors.New("no CA certificates match the SCEP certificate selector")
+	}
+
 	var err error
 	tmpl.SignerCert, tmpl.SignerKey, err = c.signerProvider(ctx)
 	if err != nil {
@@ -190,15 +197,24 @@ func (c *Client) Sign(ctx context.Context, csr *x509.CertificateRequest, selecto
 		return nil, fmt.Errorf("executing PKIOperation: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("SCEP server returned HTTP %d", resp.StatusCode)
+	}
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, Limit1MB))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
-	respMsg, err := scep.ParsePKIMessage(respBody)
+	respMsg, err := scep.ParsePKIMessage(respBody, scep.WithCACerts(c.certs))
 	if err != nil {
 		return nil, fmt.Errorf("parsing response pki message: %w", err)
+	}
+
+	if respMsg.MessageType != scep.CertRep || respMsg.CertRepMessage == nil ||
+		respMsg.TransactionID != pkiMessageReq.TransactionID ||
+		!bytes.Equal(respMsg.RecipientNonce, pkiMessageReq.SenderNonce) {
+		return nil, errors.New("SCEP response does not match the enrollment request")
 	}
 
 	switch respMsg.PKIStatus {
@@ -211,7 +227,7 @@ func (c *Client) Sign(ctx context.Context, csr *x509.CertificateRequest, selecto
 		return nil, fmt.Errorf("unknown scep pki status: %s", respMsg.PKIStatus)
 	}
 
-	err = respMsg.DecryptPKIEnvelope(tmpl.SignerCert, tmpl.SignerKey)
+	err = decryptReply(respMsg, tmpl.SignerCert, tmpl.SignerKey)
 	if err != nil {
 		return nil, fmt.Errorf("decrypting response pki message: %w", err)
 	}
@@ -230,10 +246,20 @@ func (c *Client) FullSign(ctx context.Context, csr *x509.CertificateRequest, caM
 		return nil, fmt.Errorf("error GetCACert: %w", err)
 	}
 
-	cert, err := c.Sign(ctx, csr, nil)
+	cert, err := c.Sign(ctx, csr, selector)
 	if err != nil {
 		return nil, fmt.Errorf("error PKIOperation: %w", err)
 	}
 
 	return cert, nil
+}
+
+func decryptReply(message *scep.PKIMessage, cert *x509.Certificate, key crypto.PrivateKey) (err error) {
+	// The CMS dependency can panic on malformed ciphertext or an empty certificate list.
+	defer func() {
+		if recover() != nil {
+			err = errors.New("malformed SCEP certificate envelope")
+		}
+	}()
+	return message.DecryptPKIEnvelope(cert, key)
 }

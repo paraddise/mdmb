@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jessepeterson/mdmb/internal/device"
+	"github.com/jessepeterson/mdmb/internal/tui"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -57,6 +58,7 @@ func (b *devicePkgBag) List(context.Context) ([]string, error) {
 func main() {
 	var subCmds []subCmd = []subCmd{
 		{"help", "Display usage help", help},
+		{"tui", "manage devices and profiles in the terminal", nil},
 		{"devices-list", "list created devices", devicesList},
 		{"devices-create", "create new devices", devicesCreate},
 		{"devices-connect", "devices connect to MDM", devicesConnect},
@@ -89,6 +91,33 @@ func main() {
 		fmt.Fprintln(f.Output(), "no subcommand supplied")
 		f.Usage()
 		os.Exit(2)
+	}
+
+	if f.Args()[0] == "tui" {
+		tuiFlags := flag.NewFlagSet("tui", flag.ExitOnError)
+		certPath := tuiFlags.String("jamf-cert", "", "registered Jamf Framework certificate (PEM or DER)")
+		keyPath := tuiFlags.String("jamf-key", "", "private key for the Jamf Framework certificate (PEM)")
+		tuiFlags.Usage = func() {
+			fmt.Fprintln(tuiFlags.Output(), "Usage: mdmb [-db path] tui [flags]")
+			tuiFlags.PrintDefaults()
+		}
+		tuiFlags.Parse(f.Args()[1:])
+		if tuiFlags.NArg() != 0 || *uuids != "" || (*certPath == "") != (*keyPath == "") {
+			tuiFlags.Usage()
+			os.Exit(2)
+		}
+		var identity *device.JamfFrameworkIdentity
+		if *certPath != "" {
+			var err error
+			identity, err = device.LoadJamfFrameworkIdentity(*certPath, *keyPath)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		if err := tui.Run(*dbPath, identity); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	db, err := bolt.Open(*dbPath, 0644, nil)
@@ -227,10 +256,13 @@ func devicesList(name string, args []string, rctx RunContext, usage func()) {
 func devicesCreate(name string, args []string, rctx RunContext, usage func()) {
 	f := flag.NewFlagSet(name, flag.ExitOnError)
 	var (
-		number = f.Int("n", 1, "number of devices")
+		number       = f.Int("n", 1, "number of devices")
 		buildVersion = f.String("build-version", "", "build version (e.g. 24E263)")
 		osVersion    = f.String("os-version", "", "OS version (e.g. 15.4)")
 		productName  = f.String("product-name", "", "product name (e.g. Mac16,10)")
+		deviceName   = f.String("name", "", "device name (ComputerName)")
+		serial       = f.String("serial", "", "device serial number")
+		udid         = f.String("udid", "", "device UDID (uppercase UUID)")
 	)
 	setSubCommandFlagSetUsage(f, usage)
 	f.Parse(args)
@@ -248,6 +280,15 @@ func devicesCreate(name string, args []string, rctx RunContext, usage func()) {
 		}
 		if *osVersion != "" {
 			d.OSVersion = *osVersion
+		}
+		if *deviceName != "" {
+			d.ComputerName = *deviceName
+		}
+		if *serial != "" {
+			d.Serial = *serial
+		}
+		if *udid != "" {
+			d.UDID = strings.ToUpper(*udid)
 		}
 		if *productName != "" {
 			d.ProductName = *productName

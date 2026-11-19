@@ -21,11 +21,10 @@ type Device struct {
 	OSVersion    string
 	ProductName  string
 
-	boltDB *bolt.DB
+	inventoryOverrides InventoryOverrides
+	boltDB             *bolt.DB
 
-	sysKeychain     *Keychain
-	sysProfileStore *ProfileStore
-	mdmClient       *MDMClient
+	mdmClient *MDMClient
 }
 
 // New creates a new device with a random serial number and UDID

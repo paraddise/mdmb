@@ -6,7 +6,7 @@ import (
 	_ "crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
-	_ "crypto/sha1"
+	"crypto/sha1"
 	_ "crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jessepeterson/cfgprofiles"
 	mdmbscepclient "github.com/jessepeterson/mdmb/scepclient"
 	"github.com/smallstep/scep"
@@ -105,6 +106,7 @@ func csrFromSCEPProfilePayload(pl *cfgprofiles.SCEPPayload, device *Device, rand
 	tmpl := &x509util.CertificateRequest{
 		ChallengePassword: plc.Challenge,
 	}
+	tmpl.SignatureAlgorithm = x509.SHA512WithRSA // Apple CSR: sha512WithRSAEncryption
 	// macOS seems to default using just Digital Signature
 	keyUsage := int(x509.KeyUsageDigitalSignature)
 	if plc.KeyUsage != 0 {
@@ -162,17 +164,27 @@ func selfSign() (*rsa.PrivateKey, *x509.Certificate, error) {
 	}
 
 	timeNow := time.Now()
+	ski, err := scepSKI(&priv.PublicKey)
+	if err != nil {
+		return nil, nil, err
+	}
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			CommonName: "SCEP SIGNER",
+			CommonName: "MDM SCEP SIGNER " + strings.ToUpper(uuid.NewString()),
 		},
-		NotBefore: timeNow,
-		NotAfter:  timeNow.Add(time.Hour),
-
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		NotBefore:             timeNow,
+		NotAfter:              timeNow.Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		BasicConstraintsValid: true,
+		SubjectKeyId:          ski,
+		ExtraExtensions: []pkix.Extension{
+			{
+				Id:       oidExtKeyUsage,
+				Critical: true,
+				Value:    mustASN1ClientAuth(),
+			},
+		},
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
@@ -201,7 +213,7 @@ func scepCertsSelector(fingerprint []byte) (scep.CertsSelector, error) {
 	return scep.FingerprintCertsSelector(hashType, fingerprint), nil
 }
 
-func scepNewPKCSReq(ctx context.Context, csrBytes []byte, url, _, caMessage string, fingerprint []byte) (*x509.Certificate, error) {
+func scepNewPKCSReq(ctx context.Context, csrBytes []byte, url, caMessage string, fingerprint []byte) (*x509.Certificate, error) {
 	selector, err := scepCertsSelector(fingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("scep cert selector: %w", err)
@@ -225,6 +237,49 @@ func scepNewPKCSReq(ctx context.Context, csrBytes []byte, url, _, caMessage stri
 	if err != nil {
 		return nil, fmt.Errorf("scep: %w", err)
 	}
+	if cert == nil {
+		return nil, fmt.Errorf("scep: FullSign returned nil certificate (no error)")
+	}
 
 	return cert, nil
+}
+
+func scepSKI(pub *rsa.PublicKey) ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha1.Sum(der)
+	return sum[:], nil
+}
+
+var oidExtKeyUsage = asn1.ObjectIdentifier{2, 5, 29, 37}
+
+func mustASN1ClientAuth() []byte {
+	// SEQUENCE { OID 1.3.6.1.5.5.7.3.2 } — critical clientAuth EKU
+	return []byte{0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02}
+}
+
+func (device *Device) requestSCEPCertificate(ctx context.Context, payload *cfgprofiles.SCEPPayload) (*rsa.PrivateKey, *x509.Certificate, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	key, err := keyFromSCEPProfilePayload(payload, rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	csr, err := csrFromSCEPProfilePayload(payload, device, rand.Reader, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	content := payload.PayloadContent
+	cert, err := scepNewPKCSReq(ctx, csr, content.URL, content.Name, content.CAFingerprint)
+	if err != nil {
+		return nil, nil, err
+	}
+	publicKey, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok || !key.PublicKey.Equal(publicKey) {
+		return nil, nil, errors.New("issued certificate does not match the requested key")
+	}
+	return key, cert, nil
 }

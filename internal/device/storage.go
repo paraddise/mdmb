@@ -16,31 +16,13 @@ func (device *Device) Save() error {
 		return errors.New("invalid device")
 	}
 	return device.boltDB.Update(func(tx *bolt.Tx) error {
-		err := BucketPutOrDeleteString(tx, "device_serial", device.UDID, device.Serial)
-		if err != nil {
+		if err := putInventoryFields(tx, device.UDID, device.Inventory()); err != nil {
 			return err
 		}
-		err = BucketPutOrDeleteString(tx, "device_computer_name", device.UDID, device.ComputerName)
-		if err != nil {
+		if err := BucketPutOrDeleteString(tx, "device_mdm_identity_keychain_uuid", device.UDID, device.MDMIdentityKeychainUUID); err != nil {
 			return err
 		}
-		err = BucketPutOrDeleteString(tx, "device_mdm_identity_keychain_uuid", device.UDID, device.MDMIdentityKeychainUUID)
-		if err != nil {
-			return err
-		}
-		err = BucketPutOrDeleteString(tx, "device_mdm_profile_id", device.UDID, device.MDMProfileIdentifier)
-		if err != nil {
-			return err
-		}
-		err = BucketPutOrDeleteString(tx, "device_build_version", device.UDID, device.BuildVersion)
-		if err != nil {
-			return err
-		}
-		err = BucketPutOrDeleteString(tx, "device_os_version", device.UDID, device.OSVersion)
-		if err != nil {
-			return err
-		}
-		return BucketPutOrDeleteString(tx, "device_product_name", device.UDID, device.ProductName)
+		return BucketPutOrDeleteString(tx, "device_mdm_profile_id", device.UDID, device.MDMProfileIdentifier)
 	})
 }
 
@@ -58,10 +40,12 @@ func Load(udid string, db *bolt.DB) (device *Device, err error) {
 		device.BuildVersion = BucketGetString(tx, "device_build_version", udid)
 		device.OSVersion = BucketGetString(tx, "device_os_version", udid)
 		device.ProductName = BucketGetString(tx, "device_product_name", udid)
-		return nil
+		return device.loadInventoryOverrides(tx)
 	})
 	return
 }
+
+var ErrNoDevices = errors.New("no devices in database")
 
 // List devices in bolt DB storage
 func List(db *bolt.DB) (udids []string, err error) {
@@ -76,8 +60,8 @@ func List(db *bolt.DB) (udids []string, err error) {
 		})
 		return nil
 	})
-	if len(udids) == 0 {
-		err = errors.New("no devices in database")
+	if err == nil && len(udids) == 0 {
+		err = ErrNoDevices
 	}
 	return
 }

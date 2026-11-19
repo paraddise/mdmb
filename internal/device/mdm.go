@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"os"
 
 	"github.com/groob/plist"
+
+	"github.com/jessepeterson/mdmb/internal/diagnostics"
 )
 
 func (c *MDMClient) authenticate(ctx context.Context) error {
@@ -60,11 +62,6 @@ type ConnectRequest struct {
 
 	RequestType string `plist:",omitempty"`
 }
-
-// type ConnectResponse struct {
-// 	Command     interface{}
-// 	CommandUUID string
-// }
 
 func (c *MDMClient) MdmSignature(ctx context.Context, body []byte) (string, error) {
 	return c.transport.SignMessage(ctx, body)
@@ -129,88 +126,75 @@ type ConnectResponseCommand struct {
 	RequestType string
 }
 
-type ConnectResponse struct {
-	Command     ConnectResponseCommand
-	CommandUUID string
-}
-
 func (c *MDMClient) Connect(ctx context.Context) error {
 	req := &ConnectRequest{
 		UDID:   c.Device.UDID,
 		Status: "Idle",
 	}
-	return c.connect(ctx, req)
+	auto, err := c.Device.AutoSCEPEnroll()
+	if err != nil {
+		diagnostics.Printf(ctx, os.Stderr, "SCEP settings: %v\n", err)
+	}
+	err = c.connect(ctx, req, auto)
+	if auto && ctx.Err() == nil {
+		ids, listErr := c.Device.SystemProfileStore().ListUUIDs()
+		if listErr != nil {
+			diagnostics.Printf(ctx, os.Stderr, "SCEP profiles: %v\n", listErr)
+		}
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				break
+			}
+			c.Device.autoEnrollProfile(ctx, id)
+		}
+	}
+	return err
 }
 
-func (c *MDMClient) connect(ctx context.Context, connReq interface{}) error {
+func (c *MDMClient) connect(ctx context.Context, connReq any, auto bool) error {
 	if !c.enrolled() {
 		return errors.New("device not enrolled")
 	}
-
-	r, err := PlistReader(connReq)
-	if err != nil {
-		return err
-	}
-
-	res, err := c.transport.DoReportResultsAndFetchNextCommand(ctx, r)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	respBytes, err := io.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	if res.StatusCode != 200 {
-		return fmt.Errorf("connect request failed with HTTP status: %s", res.Status)
-	}
-
-	if len(respBytes) == 0 {
-		return nil
-	}
-
-	resp := &ConnectResponse{}
-	err = plist.Unmarshal(respBytes, &resp)
-	if err != nil {
-		return err
-	}
-
-	nextConnReq, err := c.handleMDMCommand(ctx, resp.Command.RequestType, resp.CommandUUID, respBytes)
-	if err != nil {
-		log.Println(err)
-		nextConnReq = &ConnectRequest{
-			UDID:        c.Device.UDID,
-			CommandUUID: resp.CommandUUID,
-			RequestType: resp.Command.RequestType,
-			Status:      "Error",
-			ErrorChain: []ErrorChain{
-				{
-					ErrorCode:            99998,
-					ErrorDomain:          "mdmb-handle-mdm-command",
-					LocalizedDescription: "Error handling MDM command",
-				},
-			},
+	for {
+		r, err := PlistReader(connReq)
+		if err != nil {
+			return err
 		}
-	}
-
-	if nextConnReq == nil {
-		fmt.Println("empty response from handling MDM command")
-		nextConnReq = &ConnectRequest{
-			UDID:        c.Device.UDID,
-			CommandUUID: resp.CommandUUID,
-			RequestType: resp.Command.RequestType,
-			Status:      "Error",
-			ErrorChain: []ErrorChain{
-				{
-					ErrorCode:            99999,
-					ErrorDomain:          "mdmb-handle-mdm-command",
-					LocalizedDescription: "Empty response from hanlding MDM command",
-				},
-			},
+		res, err := c.transport.DoReportResultsAndFetchNextCommand(ctx, r)
+		if err != nil {
+			return err
 		}
-	}
+		respBytes, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			return err
+		}
+		if res.StatusCode != 200 {
+			return fmt.Errorf("connect request failed with HTTP status: %s", res.Status)
+		}
 
-	return c.connect(ctx, nextConnReq)
+		// Post-acknowledgment work runs only once the server accepts the result.
+		switch response := connReq.(type) {
+		case *InstallProfileResponse:
+			if auto {
+				c.Device.autoEnrollProfile(ctx, response.profileID)
+			}
+		case *declarativeManagementResponse:
+			c.afterDeclarativeAcknowledgment(ctx, response.token)
+		}
+		if len(respBytes) == 0 {
+			return nil
+		}
+
+		var envelope map[string]any
+		if err := unmarshalPlist(respBytes, &envelope); err != nil {
+			return err
+		}
+		commandUUID := stringField(envelope, "CommandUUID")
+		if commandUUID == "" {
+			return errors.New("MDM command has no CommandUUID")
+		}
+		reqType := stringField(dictionaryField(envelope, "Command"), "RequestType")
+		connReq = c.handleMDMEnvelope(ctx, reqType, commandUUID, dictionaryField(envelope, "Command"))
+	}
 }

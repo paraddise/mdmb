@@ -2,14 +2,15 @@ package device
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 
-	"github.com/groob/plist"
 	"github.com/jessepeterson/cfgprofiles"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/jessepeterson/mdmb/internal/diagnostics"
 )
 
 type ProfileStore struct {
@@ -22,38 +23,61 @@ func NewProfileStore(id string, db *bolt.DB) *ProfileStore {
 	return &ProfileStore{ID: id, DB: db}
 }
 
-func (ps *ProfileStore) Load(id string) (p *cfgprofiles.Profile, err error) {
-	pb := []byte{}
+func (ps *ProfileStore) Raw(id string) ([]byte, error) {
+	var pb []byte
 	key := fmt.Sprintf("%s_%s", ps.ID, id)
-	err = ps.DB.View(func(tx *bolt.Tx) error {
-		pb = BucketGet(tx, "profiles", key)
+	err := ps.DB.View(func(tx *bolt.Tx) error {
+		pb = append([]byte(nil), BucketGet(tx, "profiles", key)...)
 		return nil
 	})
 	if err != nil {
-		return
+		return nil, err
 	}
 	if len(pb) == 0 {
 		return nil, fmt.Errorf("missing or zero-length profile: %s", id)
 	}
-	p = &cfgprofiles.Profile{}
-	err = plist.Unmarshal(pb, p)
-	return
+	return pb, nil
 }
 
+func (ps *ProfileStore) Load(id string) (*cfgprofiles.Profile, error) {
+	pb, err := ps.Raw(id)
+	if err != nil {
+		return nil, err
+	}
+	p := &cfgprofiles.Profile{}
+	return p, unmarshalProfile(pb, p)
+}
+
+const managedProfileBucket = "device_managed_profiles"
+
 func (ps *ProfileStore) persistProfile(pb []byte, profileID string) error {
+	return ps.persistProfileSource(pb, profileID, false)
+}
+
+func (ps *ProfileStore) persistProfileSource(pb []byte, profileID string, managed bool) error {
 	if len(pb) == 0 {
 		return errors.New("empty profile")
 	}
-	key := fmt.Sprintf("%s_%s", ps.ID, profileID)
+	key := ps.ID + "_" + profileID
 	return ps.DB.Update(func(tx *bolt.Tx) error {
-		return BucketPutOrDelete(tx, "profiles", key, pb)
+		if err := BucketPutOrDelete(tx, "profiles", key, pb); err != nil {
+			return err
+		}
+		var source string
+		if managed {
+			source = "1"
+		}
+		return BucketPutOrDeleteString(tx, managedProfileBucket, key, source)
 	})
 }
 
 func (ps *ProfileStore) removeProfile(profileID string) error {
-	key := fmt.Sprintf("%s_%s", ps.ID, profileID)
+	key := ps.ID + "_" + profileID
 	return ps.DB.Update(func(tx *bolt.Tx) error {
-		return BucketPutOrDelete(tx, "profiles", key, nil)
+		if err := BucketPutOrDelete(tx, "profiles", key, nil); err != nil {
+			return err
+		}
+		return BucketPutOrDeleteString(tx, managedProfileBucket, key, "")
 	})
 }
 
@@ -92,10 +116,7 @@ func (ps *ProfileStore) ListUUIDs() (uuids []string, err error) {
 }
 
 func (device *Device) SystemProfileStore() *ProfileStore {
-	if device.sysProfileStore == nil {
-		device.sysProfileStore = NewProfileStore(device.UDID, device.boltDB)
-	}
-	return device.sysProfileStore
+	return NewProfileStore(device.UDID, device.boltDB)
 }
 
 const (
@@ -138,7 +159,7 @@ func (device *Device) ValidateProfileInstall(p *cfgprofiles.Profile, fromMDM boo
 				return err
 			}
 			mdmPldsOld := p.MDMPayloads()
-			if len(mdmPlds) != 1 {
+			if len(mdmPldsOld) != 1 {
 				return errors.New("invalid existing MDM profile")
 			}
 			mdmPldOld := mdmPldsOld[0]
@@ -187,23 +208,63 @@ func classifyAndSortProfilePayloads(p *cfgprofiles.Profile, ascending bool) []*p
 }
 
 func (device *Device) InstallProfile(ctx context.Context, pb []byte) error {
-	return device.installProfile(ctx, pb, false)
+	return device.installProfile(ctx, pb)
 }
 
-func (device *Device) installProfileFromMDM(ctx context.Context, pb []byte) error {
-	return device.installProfile(ctx, pb, true)
+func (device *Device) installProfileFromMDM(ctx context.Context, pb []byte) (string, error) {
+	var envelope struct {
+		PayloadIdentifier string
+		PayloadContent    []struct{ PayloadType, PayloadUUID string }
+	}
+	if err := unmarshalPlist(pb, &envelope); err != nil {
+		return "", fmt.Errorf("%w: malformed profile payload", errCommandFormat)
+	}
+	id := envelope.PayloadIdentifier
+	if id == "" {
+		return "", fmt.Errorf("%w: profile has no identifier", errCommandFormat)
+	}
+	mdmPayloads := 0
+	for _, payload := range envelope.PayloadContent {
+		switch payload.PayloadType {
+		case "com.apple.mdm":
+			mdmPayloads++
+		case scepPayloadType, "com.apple.security.root", "com.apple.security.pkcs1", "com.apple.security.pem":
+		default:
+			diagnostics.Printf(ctx, os.Stdout, "unknown payload type %s uuid %s not processed\n", payload.PayloadType, payload.PayloadUUID)
+		}
+	}
+	if mdmPayloads > 0 || id == device.MDMProfileIdentifier {
+		if mdmPayloads != 1 || id != device.MDMProfileIdentifier {
+			return "", errors.New("MDM install would replace the active enrollment profile")
+		}
+		p := &cfgprofiles.Profile{}
+		if err := unmarshalProfile(pb, p); err != nil {
+			return "", err
+		}
+		if err := device.ValidateProfileInstall(p, true); err != nil {
+			return "", err
+		}
+		current, err := device.SystemProfileStore().Load(id)
+		if err != nil {
+			return "", err
+		}
+		if p.MDMPayloads()[0].IdentityCertificateUUID != current.MDMPayloads()[0].IdentityCertificateUUID {
+			return "", errors.New("MDM profile must keep its active identity reference")
+		}
+	}
+	return id, device.SystemProfileStore().persistProfileSource(pb, id, true)
 }
 
-func (device *Device) installProfile(ctx context.Context, pb []byte, fromMDM bool) error {
+func (device *Device) installProfile(ctx context.Context, pb []byte) error {
 	if len(pb) == 0 {
 		return errors.New("empty profile")
 	}
 	p := &cfgprofiles.Profile{}
-	err := plist.Unmarshal(pb, p)
+	err := unmarshalProfile(pb, p)
 	if err != nil {
 		return err
 	}
-	err = device.ValidateProfileInstall(p, fromMDM)
+	err = device.ValidateProfileInstall(p, false)
 	if err != nil {
 		return err
 	}
@@ -219,7 +280,7 @@ func (device *Device) installProfile(ctx context.Context, pb []byte, fromMDM boo
 	}
 	if matched != "" {
 		// remove the existing installed profile
-		device.RemoveProfile(matched)
+		device.removeProfile(ctx, matched)
 	}
 
 	orderedPayloads := classifyAndSortProfilePayloads(p, false)
@@ -253,7 +314,7 @@ func (device *Device) installProfile(ctx context.Context, pb []byte, fromMDM boo
 				return err
 			}
 		default:
-			fmt.Printf("unknown payload type %s uuid %s not processed\n", pr.CommonPayload.PayloadType, pr.CommonPayload.PayloadUUID)
+			diagnostics.Printf(ctx, os.Stdout, "unknown payload type %s uuid %s not processed\n", pr.CommonPayload.PayloadType, pr.CommonPayload.PayloadUUID)
 		}
 	}
 
@@ -276,24 +337,7 @@ func (device *Device) installMDMPayload(ctx context.Context, mdmPayload *cfgprof
 
 // installSCEPPayload ... and returns the keychain identity UUID
 func (device *Device) installSCEPPayload(ctx context.Context, profileID string, scepPayload *cfgprofiles.SCEPPayload) (string, error) {
-	key, err := keyFromSCEPProfilePayload(scepPayload, rand.Reader)
-	if err != nil {
-		return "", err
-	}
-
-	csrBytes, err := csrFromSCEPProfilePayload(scepPayload, device, rand.Reader, key)
-	if err != nil {
-		return "", err
-	}
-
-	cert, err := scepNewPKCSReq(
-		ctx,
-		csrBytes,
-		scepPayload.PayloadContent.URL,
-		scepPayload.PayloadContent.Challenge,
-		scepPayload.PayloadContent.Name,
-		scepPayload.PayloadContent.CAFingerprint,
-	)
+	key, cert, err := device.requestSCEPCertificate(ctx, scepPayload)
 	if err != nil {
 		return "", err
 	}
@@ -329,6 +373,10 @@ func (device *Device) installSCEPPayload(ctx context.Context, profileID string, 
 }
 
 func (device *Device) RemoveProfile(profileID string) error {
+	return device.removeProfile(context.Background(), profileID)
+}
+
+func (device *Device) removeProfile(ctx context.Context, profileID string) error {
 	p, err := device.SystemProfileStore().Load(profileID)
 	if err != nil {
 		return err
@@ -340,15 +388,15 @@ func (device *Device) RemoveProfile(profileID string) error {
 		case *cfgprofiles.SCEPPayload:
 			err = device.removeSCEPPayload(p.PayloadIdentifier, pl)
 			if err != nil {
-				fmt.Println(err)
+				diagnostics.Printf(ctx, os.Stdout, "%v\n", err)
 			}
 		case *cfgprofiles.MDMPayload:
 			err = device.removeMDMPayload()
 			if err != nil {
-				fmt.Println(err)
+				diagnostics.Printf(ctx, os.Stdout, "%v\n", err)
 			}
 		default:
-			fmt.Printf("unknown payload type %s uuid %s not processed\n", pr.CommonPayload.PayloadType, pr.CommonPayload.PayloadUUID)
+			diagnostics.Printf(ctx, os.Stdout, "unknown payload type %s uuid %s not processed\n", pr.CommonPayload.PayloadType, pr.CommonPayload.PayloadUUID)
 		}
 	}
 
